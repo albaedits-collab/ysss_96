@@ -15,19 +15,14 @@ from fastapi import FastAPI, Header, HTTPException
 # =========================
 ALLOW = {
     "alifta.gov.sa",
-    "alifta.net",
     "binbaz.org.sa",
     "binothaimeen.net",
     "alfawzan.af.org.sa",
-    "alalbani.info",
     "sualruhaily.com",
     "rabee.net",
-    "miraath.net",
     "al-badr.net",
     "alnajmi.net",
-    "muqbel.net",
     "lohaidan.af.org.sa",
-    "home.ajurry.com",
 }
 
 DENY = {
@@ -289,3 +284,4 @@ def search(
             break
 
     return {"query": q, "scoped_query": scoped, "results": out}
+
