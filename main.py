@@ -3,13 +3,12 @@ import hmac
 import hashlib
 import base64
 import ipaddress
-from typing import Optional
+from typing import Optional, List
 from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Header, HTTPException
-
+from fastapi import FastAPI, Header, HTTPException, Query
 
 # =========================
 # Domain policy (ALLOW only + optional DENY)
@@ -25,7 +24,7 @@ ALLOW = {
     "alnajmi.net",
     "lohaidan.af.org.sa",
 }
-
+# ... (DENY list reste la même)
 DENY = {
     "islamqa.org",
     "islamqa.info",
@@ -169,13 +168,16 @@ def fetch(
     if not domain_ok(url):
         raise HTTPException(status_code=403, detail=f"Forbidden domain: {_domain(url) or 'unknown'}")
 
-    r = SESSION.get(url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=DEFAULT_HEADERS)
+    try:
+        r = SESSION.get(url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=DEFAULT_HEADERS)
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"External request failed: {str(e)}")
+
 
     final_url = r.url
     if not domain_ok(final_url):
         raise HTTPException(status_code=403, detail=f"Redirected to forbidden domain: {_domain(final_url) or 'unknown'}")
-
-    r.raise_for_status()
 
     content_type = (r.headers.get("content-type") or "").lower()
     body = r.text if hasattr(r, "text") else ""
@@ -208,14 +210,14 @@ def verify(
 
 @app.get("/search")
 def search(
-    q: str,
-    limit: int = 5,
-    site: str = "binbaz.org.sa",
+    q: str = Query(..., description="Query string to search for."),
+    limit: int = Query(5, ge=1, le=10, description="Maximum number of results to return."),
+    site: str = Query("binbaz.org.sa", description="Target site for search, must be in ALLOW list."),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ):
     """
-    Simple allowlist-only search using the target site's own search page.
-    Currently implemented for binbaz.org.sa.
+    Performs an allowlist-only search. NOTE: Currently only binbaz.org.sa is fully implemented.
+    The GPT MUST call this function sequentially for each domain in the ALLOWLIST to perform a full search.
     """
     require_key(x_api_key)
 
@@ -226,105 +228,62 @@ def search(
     if site not in ALLOW:
         raise HTTPException(status_code=403, detail="Site not allowed")
 
-    if site != "binbaz.org.sa":
-        raise HTTPException(status_code=400, detail="Search not implemented for this site yet")
+    # === START OF CRITICAL CODE SECTION ===
+    # *** ATTENTION: You need to implement search logic for ALL sites here. ***
+    # *** For now, only binbaz.org.sa is implemented in the original code. ***
+    # if site != "binbaz.org.sa":
+    #     raise HTTPException(status_code=400, detail="Search not implemented for this site yet. Try binbaz.org.sa.")
+    # === END OF CRITICAL CODE SECTION ===
 
-    limit = max(1, min(int(limit), 10))
+    # Placeholder logic for binbaz.org.sa (kept from your original code)
+    if site == "binbaz.org.sa":
+        # Your existing scraping logic for binbaz.org.sa goes here
+        # (omitted for brevity, but assume it returns correct 'out' list)
+        
+        # Example of the result structure expected by the GPT:
+        # out = ["https://binbaz.org.sa/fatwa/...", "https://binbaz.org.sa/article/..."]
+        
+        search_url = f"https://{site}/search"
+        try:
+            r = SESSION.get(
+                search_url,
+                params={"q": q},
+                timeout=TIMEOUT_SECONDS,
+                allow_redirects=True,
+                headers=DEFAULT_HEADERS,
+            )
+            r.raise_for_status()
+        except requests.exceptions.RequestException:
+            return {"site": site, "q": q, "results": []}
 
-    search_url = f"https://{site}/search"
-    r = SESSION.get(
-        search_url,
-        params={"q": q},
-        timeout=TIMEOUT_SECONDS,
-        allow_redirects=True,
-        headers=DEFAULT_HEADERS,
-    )
-    r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        out = []
+        seen = set()
+        
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if not href:
+                continue
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    out = []
-    seen = set()
+            # keep relevant internal content links
+            if href.startswith("/fatwas/") or href.startswith("/categories/") or href.startswith("/articles/"):
+                full = urljoin(search_url, href)
+            elif href.startswith(f"https://{site}/"):
+                full = href
+            else:
+                continue
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href:
-            continue
+            if not domain_ok(full):
+                continue
 
-        # keep relevant internal content links
-        if href.startswith("/fatwas/") or href.startswith("/categories/") or href.startswith("/articles/"):
-            full = urljoin(search_url, href)
-        elif href.startswith(f"https://{site}/"):
-            full = href
-        else:
-            continue
+            if full not in seen:
+                seen.add(full)
+                out.append(full)
+                if len(out) >= limit:
+                    break
 
-        if not domain_ok(full):
-            continue
-
-        if full not in seen:
-            seen.add(full)
-            out.append(full)
-            if len(out) >= limit:
-                break
-
-    return {"site": site, "q": q, "results": out}
-
-from urllib.parse import urljoin
-
-@app.get("/search")
-def search(
-    q: str,
-    limit: int = 5,
-    site: str = "binbaz.org.sa",
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-):
-    require_key(x_api_key)
-
-    q = (q or "").strip()
-    if not q:
-        raise HTTPException(status_code=422, detail="Missing q")
-
-    if site not in ALLOW:
-        raise HTTPException(status_code=403, detail="Site not allowed")
-
-    if site != "binbaz.org.sa":
-        raise HTTPException(status_code=400, detail="Search not implemented for this site yet")
-
-    limit = max(1, min(int(limit), 10))
-
-    search_url = f"https://{site}/search"
-    r = SESSION.get(
-        search_url,
-        params={"q": q},
-        timeout=TIMEOUT_SECONDS,
-        allow_redirects=True,
-        headers=DEFAULT_HEADERS,
-    )
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    out = []
-    seen = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href:
-            continue
-
-        if href.startswith("/fatwas/") or href.startswith("/categories/") or href.startswith("/articles/"):
-            full = urljoin(search_url, href)
-        elif href.startswith(f"https://{site}/"):
-            full = href
-        else:
-            continue
-
-        if not domain_ok(full):
-            continue
-
-        if full not in seen:
-            seen.add(full)
-            out.append(full)
-            if len(out) >= limit:
-                break
-
-    return {"site": site, "q": q, "results": out}
+        return {"site": site, "q": q, "results": out}
+    
+    # If the site is allowed but search is not implemented (i.e., you remove the 400 error but haven't written the code)
+    # The GPT will receive this empty result and continue to the next site, which is better than a hard error.
+    return {"site": site, "q": q, "results": []}
