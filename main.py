@@ -2,8 +2,9 @@ import os
 import hmac
 import hashlib
 import base64
-from typing import Optional, List, Dict
-from urllib.parse import urlparse, parse_qs, unquote
+import ipaddress
+from typing import Optional
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -11,7 +12,7 @@ from fastapi import FastAPI, Header, HTTPException
 
 
 # =========================
-# Domain policy
+# Domain policy (ALLOW only + optional DENY)
 # =========================
 ALLOW = {
     "alifta.gov.sa",
@@ -67,16 +68,38 @@ def _domain(url: str) -> str:
     if not url:
         return ""
     p = urlparse(url)
-    return (p.netloc or "").lower().lstrip("www.")
+    d = (p.hostname or "").lower().lstrip("www.")
+    return d
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except Exception:
+        return False
 
 
 def domain_ok(url: str) -> bool:
-    d = _domain(url)
-    if not d:
+    url = _normalize_url(url)
+    if not url:
         return False
-    if any(d == x or d.endswith("." + x) for x in DENY):
+
+    p = urlparse(url)
+    host = (p.hostname or "").lower().lstrip("www.")
+    if not host:
         return False
-    return any(d == x or d.endswith("." + x) for x in ALLOW)
+
+    # block IPs + localhost-like
+    if _is_ip(host) or host in {"localhost"} or host.endswith(".local"):
+        return False
+
+    # DENY first (including subdomains)
+    if any(host == x or host.endswith("." + x) for x in DENY):
+        return False
+
+    # ALLOW then (including subdomains)
+    return any(host == x or host.endswith("." + x) for x in ALLOW)
 
 
 # =========================
@@ -109,11 +132,11 @@ def token_ok(u: str, token: str) -> bool:
 
 
 # =========================
-# HTTP session
+# HTTP / extraction
 # =========================
 SESSION = requests.Session()
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
-TIMEOUT_SECONDS = 20
+TIMEOUT_SECONDS = 25
 MAX_TEXT_CHARS = 200000
 
 
@@ -129,7 +152,7 @@ def clean_html(html: str) -> str:
 # =========================
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": "1.2.0"}
 
 
 @app.get("/fetch")
@@ -143,21 +166,14 @@ def fetch(
     if not url:
         raise HTTPException(status_code=422, detail="Missing or empty url")
 
-    d = _domain(url)
     if not domain_ok(url):
-        raise HTTPException(status_code=403, detail=f"Forbidden domain: {d or 'unknown'}")
+        raise HTTPException(status_code=403, detail=f"Forbidden domain: {_domain(url) or 'unknown'}")
 
-    r = SESSION.get(
-        url,
-        timeout=TIMEOUT_SECONDS,
-        allow_redirects=True,
-        headers=DEFAULT_HEADERS,
-    )
+    r = SESSION.get(url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=DEFAULT_HEADERS)
 
     final_url = r.url
-    final_domain = _domain(final_url)
     if not domain_ok(final_url):
-        raise HTTPException(status_code=403, detail=f"Redirected to forbidden domain: {final_domain or 'unknown'}")
+        raise HTTPException(status_code=403, detail=f"Redirected to forbidden domain: {_domain(final_url) or 'unknown'}")
 
     r.raise_for_status()
 
@@ -184,104 +200,71 @@ def verify(
     require_key(x_api_key)
 
     url = _normalize_url(url)
-    if not url:
-        return {"ok": False}
-    if not domain_ok(url):
+    if not url or not domain_ok(url):
         return {"ok": False}
 
     return {"ok": token_ok(url, token)}
 
 
-def _ddg_extract_real_url(href: str) -> str:
-    """
-    DuckDuckGo sometimes returns redirect links like:
-    https://duckduckgo.com/l/?uddg=<ENCODED_URL>
-    """
-    href = (href or "").strip()
-    if not href:
-        return ""
-
-    p = urlparse(href)
-
-    # absolute ddg redirect
-    if p.netloc.endswith("duckduckgo.com") and p.path.startswith("/l/"):
-        qs = parse_qs(p.query or "")
-        if "uddg" in qs and qs["uddg"]:
-            return unquote(qs["uddg"][0])
-
-    # relative ddg redirect
-    if p.netloc == "" and href.startswith("/l/?"):
-        qs = parse_qs(urlparse("https://duckduckgo.com" + href).query or "")
-        if "uddg" in qs and qs["uddg"]:
-            return unquote(qs["uddg"][0])
-
-    return href
-
-
 @app.get("/search")
 def search(
     q: str,
-    site: Optional[str] = None,
-    limit: int = 8,
+    limit: int = 5,
+    site: str = "binbaz.org.sa",
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ):
     """
-    Returns allowlisted URLs only.
-    Uses DuckDuckGo HTML as a discovery layer, then filters to ALLOW.
+    Simple allowlist-only search using the target site's own search page.
+    Currently implemented for binbaz.org.sa.
     """
     require_key(x_api_key)
 
     q = (q or "").strip()
     if not q:
-        raise HTTPException(status_code=422, detail="Missing or empty q")
-    if limit < 1:
-        limit = 1
-    if limit > 12:
-        limit = 12
+        raise HTTPException(status_code=422, detail="Missing q")
 
-    if site:
-        site = site.strip().lower().lstrip("www.")
-        if site not in ALLOW:
-            raise HTTPException(status_code=403, detail=f"Site not allowlisted: {site}")
-        scoped = f"site:{site} {q}"
-    else:
-        scoped_sites = " OR ".join([f"site:{d}" for d in sorted(ALLOW)])
-        scoped = f"({scoped_sites}) {q}"
+    if site not in ALLOW:
+        raise HTTPException(status_code=403, detail="Site not allowed")
 
-    # DuckDuckGo HTML endpoint
-    ddg_url = "https://duckduckgo.com/html/"
-    try:
-        r = SESSION.get(
-            ddg_url,
-            params={"q": scoped},
-            timeout=TIMEOUT_SECONDS,
-            headers=DEFAULT_HEADERS,
-        )
-        r.raise_for_status()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Search provider error: {type(e).__name__}")
+    if site != "binbaz.org.sa":
+        raise HTTPException(status_code=400, detail="Search not implemented for this site yet")
+
+    limit = max(1, min(int(limit), 10))
+
+    search_url = f"https://{site}/search"
+    r = SESSION.get(
+        search_url,
+        params={"q": q},
+        timeout=TIMEOUT_SECONDS,
+        allow_redirects=True,
+        headers=DEFAULT_HEADERS,
+    )
+    r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
-    out: List[Dict[str, str]] = []
+    out = []
     seen = set()
 
-    for a in soup.select("a.result__a"):
-        href = a.get("href") or ""
-        real = _ddg_extract_real_url(href)
-        real = _normalize_url(real)
-
-        if not real:
-            continue
-        if not domain_ok(real):
-            continue
-        if real in seen:
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href:
             continue
 
-        seen.add(real)
-        title = " ".join((a.get_text(" ") or "").split())
-        out.append({"url": real, "title": title})
-        if len(out) >= limit:
-            break
+        # keep relevant internal content links
+        if href.startswith("/fatwas/") or href.startswith("/categories/") or href.startswith("/articles/"):
+            full = urljoin(search_url, href)
+        elif href.startswith(f"https://{site}/"):
+            full = href
+        else:
+            continue
 
-    return {"query": q, "scoped_query": scoped, "results": out}
+        if not domain_ok(full):
+            continue
 
+        if full not in seen:
+            seen.add(full)
+            out.append(full)
+            if len(out) >= limit:
+                break
+
+    return {"site": site, "q": q, "results": out}
