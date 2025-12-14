@@ -2,8 +2,8 @@ import os
 import hmac
 import hashlib
 import base64
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Optional, List, Dict
+from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -15,6 +15,7 @@ from fastapi import FastAPI, Header, HTTPException
 # =========================
 ALLOW = {
     "alifta.gov.sa",
+    "alifta.net",
     "binbaz.org.sa",
     "binothaimeen.net",
     "alfawzan.af.org.sa",
@@ -88,7 +89,7 @@ def domain_ok(url: str) -> bool:
 # =========================
 APP_KEY = os.environ.get("APP_KEY", "").strip()
 
-app = FastAPI(title="Salafi Source Gate", version="1.1.1")
+app = FastAPI(title="Salafi Source Gate", version="1.2.0")
 
 
 def require_key(x_api_key: Optional[str]) -> None:
@@ -113,7 +114,7 @@ def token_ok(u: str, token: str) -> bool:
 
 
 # =========================
-# Content extraction
+# HTTP session
 # =========================
 SESSION = requests.Session()
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -190,8 +191,101 @@ def verify(
     url = _normalize_url(url)
     if not url:
         return {"ok": False}
-
     if not domain_ok(url):
         return {"ok": False}
 
     return {"ok": token_ok(url, token)}
+
+
+def _ddg_extract_real_url(href: str) -> str:
+    """
+    DuckDuckGo sometimes returns redirect links like:
+    https://duckduckgo.com/l/?uddg=<ENCODED_URL>
+    """
+    href = (href or "").strip()
+    if not href:
+        return ""
+
+    p = urlparse(href)
+
+    # absolute ddg redirect
+    if p.netloc.endswith("duckduckgo.com") and p.path.startswith("/l/"):
+        qs = parse_qs(p.query or "")
+        if "uddg" in qs and qs["uddg"]:
+            return unquote(qs["uddg"][0])
+
+    # relative ddg redirect
+    if p.netloc == "" and href.startswith("/l/?"):
+        qs = parse_qs(urlparse("https://duckduckgo.com" + href).query or "")
+        if "uddg" in qs and qs["uddg"]:
+            return unquote(qs["uddg"][0])
+
+    return href
+
+
+@app.get("/search")
+def search(
+    q: str,
+    site: Optional[str] = None,
+    limit: int = 8,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    """
+    Returns allowlisted URLs only.
+    Uses DuckDuckGo HTML as a discovery layer, then filters to ALLOW.
+    """
+    require_key(x_api_key)
+
+    q = (q or "").strip()
+    if not q:
+        raise HTTPException(status_code=422, detail="Missing or empty q")
+    if limit < 1:
+        limit = 1
+    if limit > 12:
+        limit = 12
+
+    if site:
+        site = site.strip().lower().lstrip("www.")
+        if site not in ALLOW:
+            raise HTTPException(status_code=403, detail=f"Site not allowlisted: {site}")
+        scoped = f"site:{site} {q}"
+    else:
+        scoped_sites = " OR ".join([f"site:{d}" for d in sorted(ALLOW)])
+        scoped = f"({scoped_sites}) {q}"
+
+    # DuckDuckGo HTML endpoint
+    ddg_url = "https://duckduckgo.com/html/"
+    try:
+        r = SESSION.get(
+            ddg_url,
+            params={"q": scoped},
+            timeout=TIMEOUT_SECONDS,
+            headers=DEFAULT_HEADERS,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Search provider error: {type(e).__name__}")
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    out: List[Dict[str, str]] = []
+    seen = set()
+
+    for a in soup.select("a.result__a"):
+        href = a.get("href") or ""
+        real = _ddg_extract_real_url(href)
+        real = _normalize_url(real)
+
+        if not real:
+            continue
+        if not domain_ok(real):
+            continue
+        if real in seen:
+            continue
+
+        seen.add(real)
+        title = " ".join((a.get_text(" ") or "").split())
+        out.append({"url": real, "title": title})
+        if len(out) >= limit:
+            break
+
+    return {"query": q, "scoped_query": scoped, "results": out}
