@@ -268,3 +268,63 @@ def search(
                 break
 
     return {"site": site, "q": q, "results": out}
+
+from urllib.parse import urljoin
+
+@app.get("/search")
+def search(
+    q: str,
+    limit: int = 5,
+    site: str = "binbaz.org.sa",
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    require_key(x_api_key)
+
+    q = (q or "").strip()
+    if not q:
+        raise HTTPException(status_code=422, detail="Missing q")
+
+    if site not in ALLOW:
+        raise HTTPException(status_code=403, detail="Site not allowed")
+
+    if site != "binbaz.org.sa":
+        raise HTTPException(status_code=400, detail="Search not implemented for this site yet")
+
+    limit = max(1, min(int(limit), 10))
+
+    search_url = f"https://{site}/search"
+    r = SESSION.get(
+        search_url,
+        params={"q": q},
+        timeout=TIMEOUT_SECONDS,
+        allow_redirects=True,
+        headers=DEFAULT_HEADERS,
+    )
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    out = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href:
+            continue
+
+        if href.startswith("/fatwas/") or href.startswith("/categories/") or href.startswith("/articles/"):
+            full = urljoin(search_url, href)
+        elif href.startswith(f"https://{site}/"):
+            full = href
+        else:
+            continue
+
+        if not domain_ok(full):
+            continue
+
+        if full not in seen:
+            seen.add(full)
+            out.append(full)
+            if len(out) >= limit:
+                break
+
+    return {"site": site, "q": q, "results": out}
