@@ -1,4 +1,5 @@
 import os
+import re
 import hmac
 import hashlib
 import base64
@@ -10,8 +11,9 @@ import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException, Query
 
+
 # =========================
-# Domain policy (ALLOW only + optional DENY)
+# Domain policy
 # =========================
 ALLOW = {
     "alifta.gov.sa",
@@ -24,7 +26,7 @@ ALLOW = {
     "alnajmi.net",
     "lohaidan.af.org.sa",
 }
-# ... (DENY list reste la même)
+
 DENY = {
     "islamqa.org",
     "islamqa.info",
@@ -51,6 +53,8 @@ DENY = {
     "facebook.com",
 }
 
+ASSET_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".css", ".js", ".ico", ".pdf", ".zip")
+
 
 def _normalize_url(url: str) -> str:
     url = (url or "").strip()
@@ -58,17 +62,19 @@ def _normalize_url(url: str) -> str:
         return ""
     p = urlparse(url)
     if not p.scheme:
-        return "https://" + url
+        url = "https://" + url
+        p = urlparse(url)
+    if p.scheme not in {"http", "https"}:
+        return ""
     return url
 
 
-def _domain(url: str) -> str:
+def _host(url: str) -> str:
     url = _normalize_url(url)
     if not url:
         return ""
     p = urlparse(url)
-    d = (p.hostname or "").lower().lstrip("www.")
-    return d
+    return (p.hostname or "").lower().lstrip("www.")
 
 
 def _is_ip(host: str) -> bool:
@@ -84,8 +90,7 @@ def domain_ok(url: str) -> bool:
     if not url:
         return False
 
-    p = urlparse(url)
-    host = (p.hostname or "").lower().lstrip("www.")
+    host = _host(url)
     if not host:
         return False
 
@@ -106,7 +111,7 @@ def domain_ok(url: str) -> bool:
 # =========================
 APP_KEY = os.environ.get("APP_KEY", "").strip()
 
-app = FastAPI(title="Salafi Source Gate", version="1.2.0")
+app = FastAPI(title="Salafi Source Gate", version="1.2.1")
 
 
 def require_key(x_api_key: Optional[str]) -> None:
@@ -146,12 +151,55 @@ def clean_html(html: str) -> str:
     return " ".join(soup.get_text(separator=" ").split())
 
 
+def _clean_query(q: str) -> str:
+    q = (q or "").strip()
+    # enlève les opérateurs type: site:domain
+    q = re.sub(r"\bsite:[^\s]+\b", "", q, flags=re.IGNORECASE).strip()
+    q = re.sub(r"\s{2,}", " ", q)
+    return q[:200]
+
+
+def _valid_internal_link(full_url: str, site: str) -> bool:
+    if not full_url:
+        return False
+    u = _normalize_url(full_url)
+    if not u:
+        return False
+    if not domain_ok(u):
+        return False
+    if _host(u) != site:
+        return False
+
+    path = (urlparse(u).path or "").lower()
+    if any(path.endswith(ext) for ext in ASSET_EXT):
+        return False
+
+    # chemins utiles (binbaz + général)
+    good_prefixes = (
+        "/fatwas/",
+        "/fatwa/",
+        "/majmou-fatawa/",
+        "/noor-ala-darb/",
+        "/articles/",
+        "/categories/",
+        "/node/",
+    )
+    if path.startswith(good_prefixes):
+        return True
+
+    # fallback: accepte aussi des pages “contenu” avec chiffres (souvent des articles/entrées)
+    if re.search(r"/\d+", path):
+        return True
+
+    return False
+
+
 # =========================
 # Endpoints
 # =========================
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.2.0"}
+    return {"ok": True, "version": "1.2.1"}
 
 
 @app.get("/fetch")
@@ -166,7 +214,7 @@ def fetch(
         raise HTTPException(status_code=422, detail="Missing or empty url")
 
     if not domain_ok(url):
-        raise HTTPException(status_code=403, detail=f"Forbidden domain: {_domain(url) or 'unknown'}")
+        raise HTTPException(status_code=403, detail=f"Forbidden domain: {_host(url) or 'unknown'}")
 
     try:
         r = SESSION.get(url, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=DEFAULT_HEADERS)
@@ -174,10 +222,9 @@ def fetch(
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=503, detail=f"External request failed: {str(e)}")
 
-
     final_url = r.url
     if not domain_ok(final_url):
-        raise HTTPException(status_code=403, detail=f"Redirected to forbidden domain: {_domain(final_url) or 'unknown'}")
+        raise HTTPException(status_code=403, detail=f"Redirected to forbidden domain: {_host(final_url) or 'unknown'}")
 
     content_type = (r.headers.get("content-type") or "").lower()
     body = r.text if hasattr(r, "text") else ""
@@ -210,70 +257,52 @@ def verify(
 
 @app.get("/search")
 def search(
-    q: str = Query(..., description="Query string to search for."),
-    limit: int = Query(5, ge=1, le=10, description="Maximum number of results to return."),
-    site: str = Query("binbaz.org.sa", description="Target site for search, must be in ALLOW list."),
+    q: str = Query(..., description="Query string to search for (NO site: operator)."),
+    limit: int = Query(5, ge=1, le=10),
+    site: str = Query("binbaz.org.sa", description="Target site (must be in ALLOW)."),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ):
-    """
-    Performs an allowlist-only search. NOTE: Currently only binbaz.org.sa is fully implemented.
-    The GPT MUST call this function sequentially for each domain in the ALLOWLIST to perform a full search.
-    """
     require_key(x_api_key)
-
-    q = (q or "").strip()
-    if not q:
-        raise HTTPException(status_code=422, detail="Missing q")
 
     if site not in ALLOW:
         raise HTTPException(status_code=403, detail="Site not allowed")
 
-    # === START OF CRITICAL CODE SECTION ===
-    # *** ATTENTION: You need to implement search logic for ALL sites here. ***
-    # *** For now, only binbaz.org.sa is implemented in the original code. ***
-    # if site != "binbaz.org.sa":
-    #     raise HTTPException(status_code=400, detail="Search not implemented for this site yet. Try binbaz.org.sa.")
-    # === END OF CRITICAL CODE SECTION ===
+    q2 = _clean_query(q)
+    if not q2:
+        raise HTTPException(status_code=422, detail="Missing q after cleaning")
 
-    # Placeholder logic for binbaz.org.sa (kept from your original code)
-    if site == "binbaz.org.sa":
-        # Your existing scraping logic for binbaz.org.sa goes here
-        # (omitted for brevity, but assume it returns correct 'out' list)
-        
-        # Example of the result structure expected by the GPT:
-        # out = ["https://binbaz.org.sa/fatwa/...", "https://binbaz.org.sa/article/..."]
-        
-        search_url = f"https://{site}/search"
+    # stratégie simple: /search?q=... (marche pour binbaz)
+    base = f"https://{site}"
+    candidates = [
+        (f"{base}/search", {"q": q2}),
+        (f"{base}/search", {"query": q2}),
+    ]
+
+    out: List[str] = []
+    seen = set()
+
+    for search_url, params in candidates:
         try:
-            r = SESSION.get(
-                search_url,
-                params={"q": q},
-                timeout=TIMEOUT_SECONDS,
-                allow_redirects=True,
-                headers=DEFAULT_HEADERS,
-            )
-            r.raise_for_status()
+            r = SESSION.get(search_url, params=params, timeout=TIMEOUT_SECONDS, allow_redirects=True, headers=DEFAULT_HEADERS)
+            if r.status_code >= 400:
+                continue
         except requests.exceptions.RequestException:
-            return {"site": site, "q": q, "results": []}
+            continue
 
         soup = BeautifulSoup(r.text, "html.parser")
-        out = []
-        seen = set()
-        
         for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
+            href = (a.get("href") or "").strip()
             if not href:
                 continue
 
-            # keep relevant internal content links
-            if href.startswith("/fatwas/") or href.startswith("/categories/") or href.startswith("/articles/"):
-                full = urljoin(search_url, href)
-            elif href.startswith(f"https://{site}/"):
+            # construit une URL absolue
+            if href.startswith("http://") or href.startswith("https://"):
                 full = href
             else:
-                continue
+                full = urljoin(search_url, href)
 
-            if not domain_ok(full):
+            # filtre
+            if not _valid_internal_link(full, site):
                 continue
 
             if full not in seen:
@@ -282,8 +311,7 @@ def search(
                 if len(out) >= limit:
                     break
 
-        return {"site": site, "q": q, "results": out}
-    
-    # If the site is allowed but search is not implemented (i.e., you remove the 400 error but haven't written the code)
-    # The GPT will receive this empty result and continue to the next site, which is better than a hard error.
-    return {"site": site, "q": q, "results": []}
+        if len(out) >= limit:
+            break
+
+    return {"site": site, "q": q2, "results": out}
