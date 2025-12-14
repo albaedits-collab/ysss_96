@@ -57,10 +57,9 @@ DENY = {
 
 
 def _normalize_url(url: str) -> str:
-    """Accepts 'example.com/path' and turns it into 'https://example.com/path'."""
     url = (url or "").strip()
     if not url:
-        return url
+        return ""
     p = urlparse(url)
     if not p.scheme:
         return "https://" + url
@@ -69,19 +68,18 @@ def _normalize_url(url: str) -> str:
 
 def _domain(url: str) -> str:
     url = _normalize_url(url)
+    if not url:
+        return ""
     p = urlparse(url)
-    d = (p.netloc or "").lower().lstrip("www.")
-    return d
+    return (p.netloc or "").lower().lstrip("www.")
 
 
 def domain_ok(url: str) -> bool:
     d = _domain(url)
     if not d:
         return False
-    # BAN first (including subdomains)
     if any(d == x or d.endswith("." + x) for x in DENY):
         return False
-    # then ALLOW (including subdomains)
     return any(d == x or d.endswith("." + x) for x in ALLOW)
 
 
@@ -90,21 +88,17 @@ def domain_ok(url: str) -> bool:
 # =========================
 APP_KEY = os.environ.get("APP_KEY", "").strip()
 
-app = FastAPI(title="Salafi Source Gate", version="1.1.0")
+app = FastAPI(title="Salafi Source Gate", version="1.1.1")
 
 
 def require_key(x_api_key: Optional[str]) -> None:
     if not APP_KEY:
-        raise HTTPException(500, "Server misconfigured: APP_KEY missing")
+        raise HTTPException(status_code=500, detail="Server misconfigured: APP_KEY missing")
     if not x_api_key or x_api_key != APP_KEY:
-        raise HTTPException(401, "Unauthorized")
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def sign_url(u: str) -> str:
-    """
-    Returns a stable HMAC token for the exact URL.
-    Used to prove the URL was produced by /fetch.
-    """
     key = APP_KEY.encode("utf-8")
     msg = u.encode("utf-8")
     digest = hmac.new(key, msg, hashlib.sha256).digest()
@@ -150,8 +144,12 @@ def fetch(
     require_key(x_api_key)
 
     url = _normalize_url(url)
+    if not url:
+        raise HTTPException(status_code=422, detail="Missing or empty url")
+
+    d = _domain(url)
     if not domain_ok(url):
-        raise HTTPException(403, "Forbidden domain")
+        raise HTTPException(status_code=403, detail=f"Forbidden domain: {d or 'unknown'}")
 
     r = SESSION.get(
         url,
@@ -161,12 +159,12 @@ def fetch(
     )
 
     final_url = r.url
+    final_domain = _domain(final_url)
     if not domain_ok(final_url):
-        raise HTTPException(403, "Redirected to forbidden domain")
+        raise HTTPException(status_code=403, detail=f"Redirected to forbidden domain: {final_domain or 'unknown'}")
 
     r.raise_for_status()
 
-    # If it looks like HTML, clean it. Otherwise return raw text (still clipped).
     content_type = (r.headers.get("content-type") or "").lower()
     body = r.text if hasattr(r, "text") else ""
     text = clean_html(body) if "html" in content_type else body
@@ -190,6 +188,9 @@ def verify(
     require_key(x_api_key)
 
     url = _normalize_url(url)
+    if not url:
+        return {"ok": False}
+
     if not domain_ok(url):
         return {"ok": False}
 
